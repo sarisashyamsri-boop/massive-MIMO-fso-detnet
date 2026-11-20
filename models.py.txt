@@ -1,0 +1,154 @@
+import itertools
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+
+class ChannelRefinementModule(nn.Module):
+    """
+    Refines initial Least Squares (LS) channel estimate while enforcing
+    strict optical non-negativity (H >= 0).
+    """
+    def __init__(self, num_tx=8, num_rx=8, hidden_dim=128):
+        super().__init__()
+        dim = num_rx * num_tx
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim)
+        )
+
+    def forward(self, H_ls):
+        B, Nr, Nt = H_ls.shape
+        flat = H_ls.reshape(B, -1)
+        delta = self.net(flat).reshape(B, Nr, Nt)
+        # ReLU guarantees optical non-negativity constraint
+        return F.relu(H_ls + delta)
+
+
+class UnfoldedPGDLayer(nn.Module):
+    """
+    Single unfolded Projected Gradient Descent (PGD) iteration combining
+    analytical gradient step with trainable neural residual correction.
+    """
+    def __init__(self, num_tx=8, num_rx=8, hidden_dim=64):
+        super().__init__()
+        self.step_size = nn.Parameter(torch.tensor(0.15))
+        # Takes [x_k, grad_k, H^T y] -> 3 * num_tx features
+        self.correction = nn.Sequential(
+            nn.Linear(3 * num_tx, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_tx)
+        )
+
+    def forward(self, x_k, H_est, y_data):
+        # Analytical gradient of 0.5 * ||y - Hx||^2 is H^T (Hx - y)
+        Hx = torch.bmm(H_est, x_k)
+        residual = Hx - y_data
+        grad = torch.bmm(H_est.transpose(1, 2), residual)
+        hty = torch.bmm(H_est.transpose(1, 2), y_data)
+
+        feat = torch.cat([x_k.squeeze(-1), grad.squeeze(-1), hty.squeeze(-1)], dim=-1)
+        neural_corr = self.correction(feat).unsqueeze(-1)
+
+        z_next = x_k - F.softplus(self.step_size) * grad + 0.1 * neural_corr
+        # Project onto valid OOK intensity interval [0, 1]
+        x_next = torch.clamp(z_next, 0.0, 1.0)
+        return x_next
+
+
+class UnfoldedFSODetNet(nn.Module):
+    """
+    Proposed Two-Stage Model-Driven Architecture:
+    Stage 1: LS Channel Estimation + Non-Negative Neural Refinement
+    Stage 2: 6-Layer Unfolded PGD Symbol Detection
+    """
+    def __init__(self, num_tx=8, num_rx=8, num_layers=6, responsivity=0.8):
+        super().__init__()
+        self.num_tx = num_tx
+        self.num_rx = num_rx
+        self.responsivity = responsivity
+        self.channel_refiner = ChannelRefinementModule(num_tx, num_rx, hidden_dim=128)
+        self.pgd_layers = nn.ModuleList([
+            UnfoldedPGDLayer(num_tx, num_rx, hidden_dim=64) for _ in range(num_layers)
+        ])
+
+    def estimate_ls_channel(self, Y_pilot, P):
+        # P is (Nt, Nt); regularized pseudo-inverse for stability
+        reg = 1e-3 * torch.eye(self.num_tx, device=P.device, dtype=P.dtype)
+        P_pinv = torch.matmul(P.T, torch.linalg.inv(torch.matmul(P, P.T) + reg))
+        H_ls = torch.matmul(Y_pilot, P_pinv.unsqueeze(0)) / self.responsivity
+        return F.relu(H_ls)
+
+    def forward(self, Y_pilot, Y_data, P):
+        B = Y_pilot.shape[0]
+        H_ls = self.estimate_ls_channel(Y_pilot, P)
+        H_est = self.channel_refiner(H_ls)
+
+        # Effective channel including photodiode responsivity
+        H_eff = self.responsivity * H_est
+        # Initialize symbol estimate at neutral OOK midpoint 0.5
+        x_k = torch.full((B, self.num_tx, 1), 0.5, device=Y_data.device, dtype=Y_data.dtype)
+
+        for layer in self.pgd_layers:
+            x_k = layer(x_k, H_eff, Y_data)
+
+        return H_est, x_k
+
+
+class JointDNN(nn.Module):
+    """
+    Conventional Black-Box Joint DNN Baseline for direct mapping from
+    [Y_pilot, Y_data] -> (H_est, x_est).
+    """
+    def __init__(self, num_tx=8, num_rx=8, hidden_dim=256):
+        super().__init__()
+        self.num_tx = num_tx
+        self.num_rx = num_rx
+        in_dim = (num_rx * num_tx) + num_rx
+        self.backbone = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.head_h = nn.Linear(hidden_dim, num_rx * num_tx)
+        self.head_x = nn.Linear(hidden_dim, num_tx)
+
+    def forward(self, Y_pilot, Y_data, P=None):
+        B = Y_pilot.shape[0]
+        inp = torch.cat([Y_pilot.reshape(B, -1), Y_data.reshape(B, -1)], dim=-1)
+        feat = self.backbone(inp)
+        H_est = F.relu(self.head_h(feat)).reshape(B, self.num_rx, self.num_tx)
+        x_est = torch.sigmoid(self.head_x(feat)).reshape(B, self.num_tx, 1)
+        return H_est, x_est
+
+
+def ls_zf_detector(Y_pilot, Y_data, P, responsivity=0.8, reg=1e-2):
+    """
+    Classical Least Squares Channel Estimation + Regularized Zero-Forcing Detection.
+    """
+    num_tx = P.shape[0]
+    P_pinv = P.T @ np.linalg.inv(P @ P.T + 1e-3 * np.eye(num_tx))
+    H_ls = np.maximum((Y_pilot @ P_pinv[None, :, :]) / responsivity, 0.0)
+
+    B = Y_data.shape[0]
+    X_hat = np.zeros((B, num_tx, 1), dtype=np.float32)
+    eye = np.eye(num_tx, dtype=np.float32)
+
+    for i in range(B):
+        H_eff = responsivity * H_ls[i]
+        W_zf = np.linalg.inv(H_eff.T @ H_eff + reg * eye) @ H_eff.T
+        x_soft = W_zf @ Y_data[i]
+        X_hat[i] = (x_soft >= 0.5).astype(np.float32)
+
+    return H_ls, X_hat
+
+
+def genie_ml_detector(H_true, Y_data, respons

@@ -1,0 +1,117 @@
+import numpy as np
+from scipy.stats import norm, gamma
+from scipy.special import erf, kv
+
+def generate_spatial_correlation_matrix(num_antennas=8, rho=0.5):
+    """Creates an exponential spatial correlation matrix for Tx/Rx arrays."""
+    idx = np.arange(num_antennas)
+    dist = np.abs(idx[:, None] - idx[None, :])
+    return rho ** dist
+
+def sample_correlated_gamma_gamma(batch_size, num_tx=8, num_rx=8, alpha=4.2, beta=1.4, rho=0.5):
+    """
+    Generates 8x8 spatially correlated Gamma-Gamma atmospheric turbulence
+    using a Gaussian Copula approach.
+    """
+    total_links = num_tx * num_rx
+    R_tx = generate_spatial_correlation_matrix(num_tx, rho)
+    R_rx = generate_spatial_correlation_matrix(num_rx, rho)
+    R_kron = np.kron(R_tx, R_rx)
+
+    # Sample correlated Gaussian variables
+    L = np.linalg.cholesky(R_kron + 1e-6 * np.eye(total_links))
+    z = np.random.randn(batch_size, total_links) @ L.T
+    u = np.clip(norm.cdf(z), 1e-7, 1 - 1e-7)
+
+    # Inverse CDF (PPF) transform for large-scale (alpha) and small-scale (beta) eddies
+    # Second independent uniform draw for the second Gamma component in Gamma-Gamma
+    z2 = np.random.randn(batch_size, total_links) @ L.T
+    u2 = np.clip(norm.cdf(z2), 1e-7, 1 - 1e-7)
+
+    I_x = gamma.ppf(u, a=alpha, scale=1.0 / alpha)
+    I_y = gamma.ppf(u2, a=beta, scale=1.0 / beta)
+    I_turb = (I_x * I_y).reshape(batch_size, num_rx, num_tx)
+    return I_turb
+
+def sample_farid_hranilovic_pointing_error(batch_size, num_tx=8, num_rx=8, beam_radius=2.0, rx_aperture=0.1, jitter_std=0.2):
+    """
+    Models pointing error loss h_p using the Farid-Hranilovic model.
+    """
+    v = (np.sqrt(np.pi) * rx_aperture) / (np.sqrt(2) * beam_radius)
+    A0 = (erf(v)) ** 2
+    w_zeq_sq = (beam_radius ** 2) * (np.sqrt(np.pi) * erf(v)) / (2 * v * np.exp(-(v ** 2)))
+    xi = np.sqrt(w_zeq_sq) / (2 * jitter_std)
+
+    # Radial displacement r follows a Rayleigh distribution -> h_p ~ A0 * u^(1 / xi^2)
+    u = np.clip(np.random.rand(batch_size, num_rx, num_tx), 1e-7, 1.0)
+    h_p = A0 * (u ** (1.0 / (xi ** 2)))
+    return h_p
+
+def generate_fso_channel(batch_size, num_tx=8, num_rx=8, regime="Moderate", rho=0.5, link_distance_km=1.0):
+    """
+    Combines Beer-Lambert attenuation, Gamma-Gamma turbulence, and pointing errors:
+    H = h_l * h_a * h_p (strictly non-negative).
+    """
+    regime_params = {
+        "Weak": (11.6, 10.1, 0.43),      # (alpha, beta, attenuation_coeff dB/km)
+        "Moderate": (4.2, 1.4, 2.5),
+        "Strong": (2.1, 1.1, 6.0)
+    }
+    alpha, beta, sigma_db_km = regime_params.get(regime, (4.2, 1.4, 2.5))
+
+    # Beer-Lambert law atmospheric attenuation
+    sigma = sigma_db_km / 4.343
+    h_l = np.exp(-sigma * link_distance_km)
+
+    h_a = sample_correlated_gamma_gamma(batch_size, num_tx, num_rx, alpha, beta, rho)
+    h_p = sample_farid_hranilovic_pointing_error(batch_size, num_tx, num_rx)
+
+    H = h_l * h_a * h_p
+    # Normalize average channel power to unity for clean SNR calibration
+    H = H / (np.mean(H) + 1e-8)
+    return H.astype(np.float32)
+
+def generate_orthogonal_pilots(num_tx=8):
+    """
+    Generates an 8x8 Hadamard-based unipolar orthogonal pilot matrix in {0, 1}.
+    """
+    H_had = np.array([[1]])
+    while H_had.shape[0] < num_tx:
+        H_had = np.block([[H_had, H_had], [H_had, -H_had]])
+    # Map {-1, +1} to OOK optical intensity {0, 1}
+    P = (H_had + 1.0) / 2.0
+    return P.astype(np.float32)
+
+def transmit_ook_frames(num_frames=500, snr_db=15.0, regime="Moderate", rho=0.5, num_tx=8, num_rx=8, responsivity=0.8):
+    """
+    Simulates pilot transmission and random OOK data transmission over 8x8 MIMO-FSO
+    with thermal noise and signal-dependent shot noise.
+    """
+    H_true = generate_fso_channel(num_frames, num_tx, num_rx, regime=regime, rho=rho)
+    P = generate_orthogonal_pilots(num_tx)  # (8, 8)
+    X_true = np.random.randint(0, 2, size=(num_frames, num_tx, 1)).astype(np.float32)
+
+    snr_linear = 10.0 ** (snr_db / 10.0)
+    # Total noise variance calibrated to average received signal energy
+    noise_var = 1.0 / snr_linear
+    # Split noise power: 70% thermal noise (signal-independent), 30% shot noise (signal-dependent)
+    thermal_std = np.sqrt(0.7 * noise_var)
+    shot_factor = np.sqrt(0.3 * noise_var)
+
+    # 1. Pilot reception: Y_pilot = R * H * P + N_pilot
+    clean_pilot = responsivity * np.matmul(H_true, P[None, :, :])
+    pilot_noise = (
+        thermal_std * np.random.randn(*clean_pilot.shape)
+        + shot_factor * np.sqrt(np.maximum(clean_pilot, 0.0)) * np.random.randn(*clean_pilot.shape)
+    )
+    Y_pilot = (clean_pilot + pilot_noise).astype(np.float32)
+
+    # 2. Data reception: Y_data = R * H * x + N_data
+    clean_data = responsivity * np.matmul(H_true, X_true)
+    data_noise = (
+        thermal_std * np.random.randn(*clean_data.shape)
+        + shot_factor * np.sqrt(np.maximum(clean_data, 0.0)) * np.random.randn(*clean_data.shape)
+    )
+    Y_data = (clean_data + data_noise).astype(np.float32)
+
+    return H_true, P, Y_pilot, Y_data, X_true
